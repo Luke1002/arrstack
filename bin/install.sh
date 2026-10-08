@@ -4,7 +4,7 @@ set -Eeuo pipefail
 trap 'printf "\nAborted.\n" >&2; exit 130' INT
 trap 'rm -rf "${_TMPDIR:-}" 2>/dev/null' EXIT
 
-REPO="LavX/arrstack"
+REPO="Luke1002/arrstack"
 # Do not name this VERSION: /etc/os-release (sourced below) defines its own
 # VERSION (e.g. Fedora "43 (KDE Plasma Desktop Edition)") that would overwrite
 # ours, making DL_BASE include literal spaces and parens and trip
