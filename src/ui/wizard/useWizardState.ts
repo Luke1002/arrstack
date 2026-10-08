@@ -1,0 +1,617 @@
+import { useState, useEffect } from "react";
+import os from "node:os";
+import { statfsSync, readFileSync } from "node:fs";
+import { detectGpus, type GpuInfo } from "../../platform/gpu.js";
+import { resolveRenderVideoGids } from "../../platform/groups.js";
+import { isDockerInstalled, isDockerRunning, isComposeV2 } from "../../platform/docker.js";
+import { checkPortFree, findFreePort } from "../../platform/ports.js";
+import { getDefaultServices, loadCatalog } from "../../catalog/index.js";
+import { generatePassword, generateApiKey } from "../../lib/random.js";
+import { VERSION } from "../../version.js";
+import type { State } from "../../state/schema.js";
+
+export interface WizardServiceItem {
+  id: string;
+  name: string;
+  checked: boolean;
+  port?: number;
+  description?: string;
+}
+
+export interface WizardState {
+  // Storage
+  storageRoot: string;
+  extraPaths: string;
+
+  // Admin
+  adminUsername: string;
+  adminPassword: string;
+
+  // GPU
+  detectedGpus: GpuInfo[];
+  gpuVendor: "none" | "intel" | "amd" | "nvidia";
+  renderGid: number | null;
+  videoGid: number | null;
+
+  // Services
+  services: WizardServiceItem[];
+
+  // Remote access
+  remoteMode: "none" | "duckdns" | "cloudflare";
+  remoteDomain: string;
+  remoteToken: string;
+
+  // Local DNS
+  localDnsEnabled: boolean;
+  localDnsInstallDnsmasq: boolean;
+  localDnsTld: string;
+
+  // System
+  timezone: string;
+  puid: number;
+  pgid: number;
+  vpnMode: "none" | "gluetun";
+  // VPN (gluetun) provider + WireGuard credentials. Only read when
+  // vpnMode === "gluetun".
+  vpnProvider: "mullvad" | "protonvpn" | "nordvpn" | "custom";
+  vpnPrivateKey: string;
+  vpnAddresses: string;    // e.g. "10.64.222.21/32"
+  vpnCountries: string;    // optional, comma-separated (e.g. "Switzerland, Sweden")
+  // custom-provider-only
+  vpnEndpointIp: string;
+  vpnEndpointPort: string; // kept as string in UI; parsed on submit
+  vpnServerPublicKey: string;
+  subtitleLanguages: string; // user-entered, comma-separated "en, hu"
+
+  // Meta
+  hostname: string;
+  loading: boolean;
+
+  // Caddy ports (user-editable if 80/443 are taken)
+  caddyHttpPort: number;
+  caddyHttpsPort: number;
+
+  // Status (for status strip)
+  dockerOk: boolean;
+  portsOk: boolean;
+  isRoot: boolean; // installer running as root -> PUID/PGID footgun warning
+  diskInfo: Array<{ path: string; freeGb: number }>;
+  portConflicts: string[]; // human-readable conflict messages
+}
+
+export function buildStateFromWizard(
+  ws: WizardState,
+  existing?: Partial<State> | null,
+): State {
+  const catalog = loadCatalog();
+  const enabledIds = ws.services.filter((s) => s.checked).map((s) => s.id);
+
+  // Auto-add infrastructure services based on user choices
+  enabledIds.push("caddy"); // always included
+  if (ws.remoteMode === "cloudflare") enabledIds.push("cloudflare-ddns");
+  if (ws.remoteMode === "duckdns") enabledIds.push("duckdns-updater");
+  if (ws.localDnsEnabled && ws.localDnsInstallDnsmasq) enabledIds.push("dnsmasq");
+  if (ws.vpnMode === "gluetun" && !enabledIds.includes("gluetun")) enabledIds.push("gluetun");
+  // deunhealth restarts the VPN-routed qBittorrent when it goes unhealthy after
+  // a reboot (Docker ignores depends_on ordering on daemon restart). Only
+  // needed when qbit actually runs inside gluetun's netns.
+  if (
+    ws.vpnMode === "gluetun" &&
+    enabledIds.includes("qbittorrent") &&
+    !enabledIds.includes("deunhealth")
+  ) {
+    enabledIds.push("deunhealth");
+  }
+
+  // Bazarr+ bundle: when bazarr is checked, auto-add its dependencies
+  if (enabledIds.includes("bazarr")) {
+    for (const dep of ["flaresolverr", "ai-subtitle-translator"]) {
+      if (!enabledIds.includes(dep)) enabledIds.push(dep);
+    }
+  }
+
+  const extraPaths = ws.extraPaths
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  // Reuse every api key persisted from a prior install/attempt, then generate
+  // one only for a service that declares apiKeyEnv and doesn't have one yet.
+  // Regenerating on reconfigure would rotate keys out from under running
+  // containers and break cross-service references (Prowlarr->arr, Jellyseerr,
+  // Bazarr) that still hold the old value. Bazarr's key has no apiKeyEnv and is
+  // minted in install.ts, but it lives in api_keys too so this carries it over.
+  const apiKeys: Record<string, string> = { ...(existing?.api_keys ?? {}) };
+  for (const id of enabledIds) {
+    const svc = catalog.find((s) => s.id === id);
+    if (svc?.apiKeyEnv && !apiKeys[id]) {
+      apiKeys[id] = generateApiKey();
+    }
+  }
+
+  const gpu: State["gpu"] = {
+    vendor: ws.gpuVendor,
+    ...(ws.detectedGpus.length > 0 && {
+      device_name: ws.detectedGpus.find((g) => g.vendor === ws.gpuVendor)?.name,
+    }),
+    ...(ws.renderGid !== null && { render_gid: ws.renderGid }),
+    ...(ws.videoGid !== null && { video_gid: ws.videoGid }),
+  };
+
+  // For duckdns mode the user types just the subdomain (e.g. "lavx") because
+  // the field hint is ".duckdns.org". Store the FQDN in state so every
+  // downstream consumer (Caddyfile wildcard, ACME DNS-01, done-screen URLs,
+  // /etc/hosts helper) sees one canonical form: "lavx.duckdns.org".
+  const normalizedDomain =
+    ws.remoteMode === "duckdns" && ws.remoteDomain
+      ? ws.remoteDomain.endsWith(".duckdns.org")
+        ? ws.remoteDomain
+        : `${ws.remoteDomain}.duckdns.org`
+      : ws.remoteDomain;
+
+  const remoteAccess: State["remote_access"] = {
+    mode: ws.remoteMode,
+    ...(normalizedDomain && { domain: normalizedDomain }),
+    ...(ws.remoteToken && { token: ws.remoteToken }),
+  };
+
+  return {
+    schema_version: 1,
+    installer_version: VERSION,
+    install_dir: `${process.env.HOME}/arrstack`,
+    storage_root: ws.storageRoot,
+    extra_paths: extraPaths,
+    admin: { username: ws.adminUsername },
+    services_enabled: enabledIds,
+    gpu,
+    remote_access: remoteAccess,
+    local_dns: {
+      enabled: ws.localDnsEnabled,
+      tld: ws.localDnsTld,
+      install_dnsmasq: ws.localDnsInstallDnsmasq,
+    },
+    vpn: (() => {
+      if (ws.vpnMode === "none") return { enabled: false };
+      const base: State["vpn"] = {
+        enabled: true,
+        provider: ws.vpnProvider,
+        type: "wireguard",
+      };
+      if (ws.vpnPrivateKey.trim()) base.private_key = ws.vpnPrivateKey.trim();
+      if (ws.vpnAddresses.trim()) base.addresses = ws.vpnAddresses.trim();
+      if (ws.vpnCountries.trim()) base.countries = ws.vpnCountries.trim();
+      if (ws.vpnProvider === "custom") {
+        if (ws.vpnEndpointIp.trim()) base.endpoint_ip = ws.vpnEndpointIp.trim();
+        const port = Number(ws.vpnEndpointPort.trim());
+        if (Number.isFinite(port) && port > 0) base.endpoint_port = port;
+        if (ws.vpnServerPublicKey.trim()) base.server_public_key = ws.vpnServerPublicKey.trim();
+      }
+      return base;
+    })(),
+    timezone: ws.timezone,
+    puid: ws.puid,
+    pgid: ws.pgid,
+    subtitle_languages: (ws.subtitleLanguages ?? "en")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => /^[a-z]{2}$/.test(s)),
+    api_keys: apiKeys,
+    // Carry persisted long-lived secrets forward so reconfigure/resume doesn't
+    // rotate the Bazarr/translator AES key or the Flask secret. install.ts
+    // fills these on first run and writes them back.
+    secrets: existing?.secrets ?? {},
+  };
+}
+
+function detectTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+// Read the admin password from a previous install/attempt (admin.txt, mode 600)
+// so the wizard reuses it instead of generating a fresh one. Returns null when
+// there is no readable admin.txt.
+function readExistingAdminPassword(installDir: string): string | null {
+  try {
+    const m = readFileSync(`${installDir}/admin.txt`, "utf-8").match(/^password:\s*(.+)$/m);
+    return m ? m[1].trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// Services managed automatically by the installer, hidden from the user grid
+// Infrastructure: caddy, ddns containers, dnsmasq
+// Bazarr+ deps: flaresolverr, ai-subtitle-translator (bundled with Bazarr+)
+const AUTO_MANAGED_SERVICES = new Set([
+  "caddy", "cloudflare-ddns", "duckdns-updater", "dnsmasq", "deunhealth",
+  "flaresolverr", "ai-subtitle-translator",
+]);
+
+function buildInitialServices(existingEnabled?: string[]): WizardServiceItem[] {
+  const catalog = loadCatalog();
+  const defaultIds = new Set(getDefaultServices().map((s) => s.id));
+  const existingSet = existingEnabled ? new Set(existingEnabled) : null;
+
+  return catalog
+    .filter((svc) => !AUTO_MANAGED_SERVICES.has(svc.id))
+    .map((svc) => ({
+      id: svc.id,
+      name: svc.name,
+      checked: existingSet ? existingSet.has(svc.id) : defaultIds.has(svc.id),
+      port: svc.adminPort ?? svc.ports[0],
+      description: svc.description,
+    }));
+}
+
+/**
+ * PUID/PGID must never be 0. Running the installer as root makes getuid()/
+ * getgid() return 0, but LinuxServer.io containers break when run as root, so
+ * fall back to the conventional 1000. Also used to sanitize a persisted 0 left
+ * behind by an installer run under an older version that didn't clamp.
+ */
+export function safeSystemId(raw: number | undefined): number {
+  return raw === undefined || raw === 0 ? 1000 : raw;
+}
+
+export function useWizardState(existingState?: Partial<State> | null) {
+  const timezone = detectTimezone();
+  // Never default PUID/PGID to 0. Under sudo/as root, getuid()/getgid() return
+  // 0, but LinuxServer.io images break when run as root ("usermod: user abc is
+  // currently used by process 1") and write root-owned config/media. Fall back
+  // to the conventional 1000; config dirs are chowned to this PUID anyway.
+  const rawUid = typeof process.getuid === "function" ? process.getuid() : 1000;
+  const rawGid = typeof process.getgid === "function" ? process.getgid() : 1000;
+  const puid = safeSystemId(rawUid);
+  const pgid = safeSystemId(rawGid);
+  const isRoot = rawUid === 0;
+
+  const defaultStorageRoot = `${process.env.HOME ?? "."}/arrstack/data`;
+  const [storageRoot, setStorageRoot] = useState(
+    existingState?.storage_root ?? defaultStorageRoot
+  );
+  const [extraPaths, setExtraPaths] = useState(
+    existingState?.extra_paths?.join(", ") ?? ""
+  );
+  const [adminUsername, setAdminUsername] = useState(
+    existingState?.admin?.username ?? "admin"
+  );
+  const [adminPassword, setAdminPassword] = useState(() => {
+    // Reuse the password from a prior install/attempt so reconfigure and
+    // --resume don't rotate it out from under already-running containers.
+    const dir = existingState?.install_dir ?? `${process.env.HOME ?? "."}/arrstack`;
+    return readExistingAdminPassword(dir) ?? generatePassword();
+  });
+
+  const [detectedGpus, setDetectedGpus] = useState<GpuInfo[]>([]);
+  const [gpuVendor, setGpuVendor] = useState<WizardState["gpuVendor"]>(
+    (existingState?.gpu?.vendor as WizardState["gpuVendor"]) ?? "none"
+  );
+  const [renderGid, setRenderGid] = useState<number | null>(
+    existingState?.gpu?.render_gid ?? null
+  );
+  const [videoGid, setVideoGid] = useState<number | null>(
+    existingState?.gpu?.video_gid ?? null
+  );
+
+  const [services, setServices] = useState<WizardServiceItem[]>(() =>
+    buildInitialServices(existingState?.services_enabled)
+  );
+
+  const [remoteMode, setRemoteMode] = useState<WizardState["remoteMode"]>(
+    (existingState?.remote_access?.mode as WizardState["remoteMode"]) ?? "none"
+  );
+  const [remoteDomain, setRemoteDomain] = useState(() => {
+    // The duckdns field only collects the subdomain; strip the FQDN suffix
+    // we appended on the previous install so the user doesn't see
+    // "lavx.duckdns.org" in a field hinted ".duckdns.org" (and double-append
+    // on re-save).
+    const stored = existingState?.remote_access?.domain ?? "";
+    if (
+      existingState?.remote_access?.mode === "duckdns" &&
+      stored.endsWith(".duckdns.org")
+    ) {
+      return stored.slice(0, -".duckdns.org".length);
+    }
+    return stored;
+  });
+  const [remoteToken, setRemoteToken] = useState(
+    existingState?.remote_access?.token ?? ""
+  );
+
+  const [localDnsInstallDnsmasq, setLocalDnsInstallDnsmasq] = useState(
+    existingState?.local_dns?.install_dnsmasq ?? true,
+  );
+  const [localDnsEnabled, setLocalDnsEnabled] = useState(
+    existingState?.local_dns?.enabled ?? false
+  );
+  const [localDnsTld, setLocalDnsTld] = useState(
+    existingState?.local_dns?.tld ?? "arrstack.local"
+  );
+
+  const [tz, setTz] = useState(existingState?.timezone ?? timezone);
+  // Reuse a persisted id on resume, but ignore a 0 left by an older root run.
+  const [puidState, setPuid] = useState(
+    existingState?.puid && existingState.puid !== 0 ? existingState.puid : puid,
+  );
+  const [pgidState, setPgid] = useState(
+    existingState?.pgid && existingState.pgid !== 0 ? existingState.pgid : pgid,
+  );
+  const [vpnMode, setVpnMode] = useState<WizardState["vpnMode"]>(() => {
+    // vpn.enabled is what controls whether we route qbittorrent through
+    // gluetun; provider now holds a real VPN service name (mullvad, etc.),
+    // so we can no longer treat it as "gluetun vs none".
+    if (!existingState?.vpn?.enabled) return "none";
+    return "gluetun";
+  });
+  const [vpnProvider, setVpnProvider] = useState<WizardState["vpnProvider"]>(() => {
+    const p = existingState?.vpn?.provider;
+    return p === "mullvad" || p === "protonvpn" || p === "nordvpn" || p === "custom"
+      ? p
+      : "mullvad";
+  });
+  const [vpnPrivateKey, setVpnPrivateKey] = useState(existingState?.vpn?.private_key ?? "");
+  const [vpnAddresses, setVpnAddresses] = useState(existingState?.vpn?.addresses ?? "");
+  const [vpnCountries, setVpnCountries] = useState(existingState?.vpn?.countries ?? "");
+  const [vpnEndpointIp, setVpnEndpointIp] = useState(existingState?.vpn?.endpoint_ip ?? "");
+  const [vpnEndpointPort, setVpnEndpointPort] = useState(
+    existingState?.vpn?.endpoint_port ? String(existingState.vpn.endpoint_port) : ""
+  );
+  const [vpnServerPublicKey, setVpnServerPublicKey] = useState(
+    existingState?.vpn?.server_public_key ?? ""
+  );
+  const [subtitleLanguages, setSubtitleLanguages] = useState<string>(
+    existingState?.subtitle_languages?.join(", ") ?? "en",
+  );
+
+  const [hostname] = useState(() => {
+    try {
+      return os.hostname();
+    } catch {
+      return "localhost";
+    }
+  });
+  const [loading, setLoading] = useState(true);
+  const [dockerOk, setDockerOk] = useState(false);
+  const [portsOk, setPortsOk] = useState(false);
+  const [diskInfo, setDiskInfo] = useState<Array<{ path: string; freeGb: number }>>([]);
+  const [portConflicts, setPortConflicts] = useState<string[]>([]);
+  const [caddyHttpPort, setCaddyHttpPort] = useState(80);
+  const [caddyHttpsPort, setCaddyHttpsPort] = useState(443);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function detect() {
+      const [gpus, gids, dockerInstalled, dockerRunning, composeOk, port80, port443] = await Promise.all([
+        detectGpus(),
+        Promise.resolve(resolveRenderVideoGids()),
+        isDockerInstalled(),
+        isDockerRunning(),
+        isComposeV2(),
+        checkPortFree(80),
+        checkPortFree(443),
+      ]);
+
+      if (cancelled) return;
+
+      setDockerOk(dockerInstalled && dockerRunning && composeOk);
+      setPortsOk(port80 && port443);
+
+      // Detect disk space for storage root
+      try {
+        const stat = statfsSync(storageRoot);
+        const freeGb = Math.round((stat.bfree * stat.bsize) / (1024 ** 3));
+        setDiskInfo([{ path: storageRoot, freeGb }]);
+      } catch {
+        setDiskInfo([]);
+      }
+
+      // Check Caddy ports (80/443) and suggest alternatives if taken
+      if (!port80) {
+        const alt = await findFreePort(8080);
+        setCaddyHttpPort(alt);
+      }
+      if (!port443) {
+        const alt = await findFreePort(8443);
+        setCaddyHttpsPort(alt);
+      }
+
+      // Check and auto-remap service ports
+      const conflicts: string[] = [];
+      const catalog = loadCatalog();
+      const updatedServices = [...services];
+      let changed = false;
+      for (let i = 0; i < updatedServices.length; i++) {
+        const svc = updatedServices[i];
+        if (!svc.port || svc.port === 80 || svc.port === 443) continue;
+        const free = await checkPortFree(svc.port);
+        if (!free) {
+          const alt = await findFreePort(svc.port + 1);
+          conflicts.push(`${svc.name}:${svc.port} in use, remapped to ${alt}`);
+          updatedServices[i] = { ...svc, port: alt };
+          changed = true;
+        }
+      }
+      if (changed) setServices(updatedServices);
+      if (conflicts.length > 0) setPortConflicts(conflicts);
+
+      if (cancelled) return;
+
+      setDetectedGpus(gpus);
+
+      if (!existingState?.gpu?.render_gid && gids.renderGid !== null) {
+        setRenderGid(gids.renderGid);
+      }
+      if (!existingState?.gpu?.video_gid && gids.videoGid !== null) {
+        setVideoGid(gids.videoGid);
+      }
+
+      // Auto-select GPU vendor if not already set via existingState
+      if (!existingState?.gpu?.vendor || existingState.gpu.vendor === "none") {
+        const knownVendors: Array<"intel" | "amd" | "nvidia"> = [
+          "intel",
+          "amd",
+          "nvidia",
+        ];
+        const detected = gpus.find((g) =>
+          knownVendors.includes(g.vendor as "intel" | "amd" | "nvidia")
+        );
+        if (detected) {
+          setGpuVendor(detected.vendor as "intel" | "amd" | "nvidia");
+        }
+      }
+
+      setLoading(false);
+    }
+
+    detect().catch(() => setLoading(false));
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function toggleService(id: string) {
+    setServices((prev) =>
+      prev.map((svc) =>
+        svc.id === id ? { ...svc, checked: !svc.checked } : svc
+      )
+    );
+  }
+
+  function toState(): State {
+    const ws: WizardState = {
+      storageRoot,
+      extraPaths,
+      adminUsername,
+      adminPassword,
+      detectedGpus,
+      gpuVendor,
+      renderGid,
+      videoGid,
+      services,
+      remoteMode,
+      remoteDomain,
+      remoteToken,
+      localDnsEnabled,
+      localDnsInstallDnsmasq,
+      localDnsTld,
+      timezone: tz,
+      puid: puidState,
+      pgid: pgidState,
+      vpnMode,
+      vpnProvider,
+      vpnPrivateKey,
+      vpnAddresses,
+      vpnCountries,
+      vpnEndpointIp,
+      vpnEndpointPort,
+      vpnServerPublicKey,
+      subtitleLanguages,
+      hostname,
+      loading,
+      caddyHttpPort,
+      caddyHttpsPort,
+      dockerOk,
+      portsOk,
+      isRoot,
+      diskInfo,
+      portConflicts,
+    };
+    return buildStateFromWizard(ws, existingState);
+  }
+
+  return {
+    // Storage
+    storageRoot,
+    setStorageRoot,
+    extraPaths,
+    setExtraPaths,
+
+    // Admin
+    adminUsername,
+    setAdminUsername,
+    adminPassword,
+    setAdminPassword,
+
+    // GPU
+    detectedGpus,
+    gpuVendor,
+    setGpuVendor,
+    renderGid,
+    setRenderGid,
+    videoGid,
+    setVideoGid,
+
+    // Services
+    services,
+    setServices,
+    toggleService,
+
+    // Remote access
+    remoteMode,
+    setRemoteMode,
+    remoteDomain,
+    setRemoteDomain,
+    remoteToken,
+    setRemoteToken,
+
+    // Local DNS
+    localDnsEnabled,
+    setLocalDnsEnabled,
+    localDnsInstallDnsmasq,
+    setLocalDnsInstallDnsmasq,
+    localDnsTld,
+    setLocalDnsTld,
+
+    // System
+    timezone: tz,
+    setTimezone: setTz,
+    puid: puidState,
+    setPuid,
+    pgid: pgidState,
+    setPgid,
+    vpnMode,
+    setVpnMode,
+    vpnProvider,
+    setVpnProvider,
+    vpnPrivateKey,
+    setVpnPrivateKey,
+    vpnAddresses,
+    setVpnAddresses,
+    vpnCountries,
+    setVpnCountries,
+    vpnEndpointIp,
+    setVpnEndpointIp,
+    vpnEndpointPort,
+    setVpnEndpointPort,
+    vpnServerPublicKey,
+    setVpnServerPublicKey,
+    subtitleLanguages,
+    setSubtitleLanguages,
+
+    // Meta
+    hostname,
+    loading,
+
+    // Status
+    dockerOk,
+    portsOk,
+    isRoot,
+    diskInfo,
+    portConflicts,
+
+    // Caddy ports
+    caddyHttpPort,
+    setCaddyHttpPort,
+    caddyHttpsPort,
+    setCaddyHttpsPort,
+
+    // Converter
+    toState,
+  };
+}

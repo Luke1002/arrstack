@@ -1,0 +1,93 @@
+networks:
+  arrstack:
+    driver: bridge
+
+services:
+{{#each services}}
+  {{id}}:
+    container_name: {{id}}
+    image: {{image}}:{{tag}}
+{{#if build}}
+    build:
+      context: {{build.context}}
+      dockerfile: {{build.dockerfile}}
+{{/if}}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+{{#if healthcheck}}
+    healthcheck:
+      test: {{healthcheck.test}}
+      interval: {{healthcheck.interval}}
+      timeout: {{healthcheck.timeout}}
+      retries: {{healthcheck.retries}}
+      start_period: {{healthcheck.start_period}}
+{{/if}}
+{{#if labels}}
+    labels:
+{{#each labels}}
+      - "{{this}}"
+{{/each}}
+{{/if}}
+{{#if vpnNetwork}}
+    network_mode: "service:gluetun"
+{{else}}
+    networks:
+      - arrstack
+{{/if}}
+{{#if ports}}
+    ports:
+{{#each ports}}
+      - "{{binding}}"
+{{/each}}
+{{/if}}
+    environment:
+      - PUID={{../puid}}
+      - PGID={{../pgid}}
+      - TZ={{../timezone}}
+{{#if apiKeyEnv}}
+      - {{apiKeyEnv}}={{apiKey}}
+{{/if}}
+{{#each extraEnv}}
+      - {{key}}={{value}}
+{{/each}}
+    volumes:
+      - {{../installDir}}/config/{{id}}:{{configPath}}
+{{#each dataMounts}}
+      - {{src}}:{{dst}}{{#if mode}}:{{mode}}{{/if}}
+{{/each}}
+{{#if devices}}
+    devices:
+{{#each devices}}
+      - {{this}}
+{{/each}}
+{{/if}}
+{{#if capAdd}}
+    cap_add:
+{{#each capAdd}}
+      - {{this}}
+{{/each}}
+{{/if}}
+{{#if groupAdd}}
+    group_add:
+{{#each groupAdd}}
+      - "{{this}}"
+{{/each}}
+{{/if}}
+{{#if dependsOn}}
+    depends_on:
+{{#if dependsOnLongForm}}
+{{#each dependsOn}}
+      {{service}}:
+        condition: {{#if condition}}{{condition}}{{else}}service_started{{/if}}
+{{/each}}
+{{else}}
+{{#each dependsOn}}
+      - {{service}}
+{{/each}}
+{{/if}}
+{{/if}}
+{{/each}}

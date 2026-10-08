@@ -1,0 +1,79 @@
+# First Run Guide
+
+Your arrstack is up. Everything below is already configured; these are just the
+URLs you need and a couple of clicks to finish.
+
+## Service URLs
+
+{{#each services}}
+- **{{name}}**: http://{{../hostIp}}:{{port}}
+{{/each}}
+{{#if hostnamesEnabled}}
+
+### Hostname access (Caddy reverse proxy on :80)
+
+Every service is also reachable at `http://<id>.{{tld}}` once the hostname
+resolves to `{{hostIp}}`.
+
+{{#if dnsmasqInstalled}}
+Resolution is already handled for you on this LAN by the **dnsmasq** container
+at `{{hostIp}}:53`. Point your router's DNS — or each client's `/etc/resolv.conf`
+— at `{{hostIp}}` and the names below just work.
+{{else}}
+No LAN DNS service is installed in this stack. To use hostnames, add this one
+line to the `/etc/hosts` file on every client that should reach the stack
+(`sudo` required on Linux/macOS, edit as Administrator on Windows):
+
+```
+{{hostsLine}}
+```
+{{/if}}
+
+Then open in a browser:
+
+{{#each services}}
+- http://{{id}}.{{../tld}}
+{{/each}}
+{{/if}}
+
+## Admin Credentials
+
+Username: **{{adminUsername}}**
+
+The generated admin password is shared across every service and was saved to
+`~/arrstack/admin.txt` at install time. To print it again later:
+
+    arrstack show-password
+
+## What is already done for you
+
+- Single admin account across every service (no per-service signup)
+- 8 public Prowlarr indexers added (CF-gated ones routed through FlareSolverr)
+  and synced to Sonarr and Radarr
+- qBittorrent download categories (tv, movies, music, books) created per TRaSH
+- Sonarr/Radarr root folders and qBittorrent as download client
+- Bazarr+ linked to Sonarr and Radarr, 6 subtitle providers enabled, language
+  profile created from your wizard selection
+- Jellyfin admin user, Movies/TV/Music libraries, and full library scan
+- Jellyseerr linked to Jellyfin, Sonarr, and Radarr; libraries enabled;
+  initial setup wizard skipped
+
+## Next steps
+
+1. Open Jellyseerr (see URL above) and sign in with the admin credentials.
+2. Request a movie or TV show. The full pipeline (Prowlarr → Sonarr/Radarr →
+   qBittorrent → Jellyfin) should handle the rest.
+3. Optional — add credentials for two subtitle providers that need accounts.
+   Open Bazarr+ **Settings → Providers** (`http://{{hostIp}}:6767/settings/providers`)
+   and paste username/password for:
+   - **OpenSubtitles.com** — free account at <https://www.opensubtitles.com>
+   - **Addic7ed** — free account at <https://www.addic7ed.com>, strong for
+     English TV releases
+
+   The other four providers — opensubtitles (Bazarr+ web scraper for
+   OpenSubtitles.org, no login needed), podnapisi, yifysubtitles, and
+   embeddedsubtitles — work out of the box, so you're not blocked without
+   these credentials.
+
+If something does not work, `arrstack doctor` checks every service and prints
+what is wrong.

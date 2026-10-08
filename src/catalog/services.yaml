@@ -1,0 +1,381 @@
+version: 1
+services:
+  - id: qbittorrent
+    name: qBittorrent
+    description: Feature-rich BitTorrent client with a web UI
+    category: download
+    image: lscr.io/linuxserver/qbittorrent
+    tag: "latest"
+    ports: [8080]
+    adminPort: 8080
+    configPath: /config
+    mounts:
+      data: /data
+    envVars: {}
+    dependsOn: []
+    health:
+      type: http
+      path: /
+      port: 8080
+    default: true
+    requiresAdminAuth: true
+
+  - id: prowlarr
+    name: Prowlarr
+    description: Indexer manager and proxy for Sonarr, Radarr, and other arr apps
+    category: indexer
+    image: lscr.io/linuxserver/prowlarr
+    tag: "latest"
+    ports: [9696]
+    adminPort: 9696
+    configPath: /config
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    health:
+      type: http
+      path: /ping
+      port: 9696
+    default: true
+    requiresAdminAuth: false
+    apiKeyEnv: PROWLARR__AUTH__APIKEY
+
+  - id: flaresolverr
+    name: FlareSolverr
+    description: Solves Cloudflare challenges for the subtitle scraper
+    category: subtitle
+    image: ghcr.io/flaresolverr/flaresolverr
+    tag: "latest"
+    ports: [8191]
+    configPath: /config
+    mounts: {}
+    envVars:
+      LOG_LEVEL: info
+    dependsOn: []
+    health:
+      type: http
+      path: /health
+      port: 8191
+    default: true
+    requiresAdminAuth: false
+
+  - id: sonarr
+    name: Sonarr
+    description: TV series management and automation
+    category: arr
+    image: lscr.io/linuxserver/sonarr
+    tag: "latest"
+    ports: [8989]
+    adminPort: 8989
+    configPath: /config
+    mounts:
+      data: /data
+    envVars: {}
+    dependsOn: [prowlarr]
+    health:
+      type: http
+      path: /ping
+      port: 8989
+    default: true
+    requiresAdminAuth: false
+    apiKeyEnv: SONARR__AUTH__APIKEY
+
+  - id: radarr
+    name: Radarr
+    description: Movie management and automation
+    category: arr
+    image: lscr.io/linuxserver/radarr
+    tag: "latest"
+    ports: [7878]
+    adminPort: 7878
+    configPath: /config
+    mounts:
+      data: /data
+    envVars: {}
+    dependsOn: [prowlarr]
+    health:
+      type: http
+      path: /ping
+      port: 7878
+    default: true
+    requiresAdminAuth: false
+    apiKeyEnv: RADARR__AUTH__APIKEY
+
+  - id: bazarr
+    name: Bazarr+
+    description: "Enhanced subtitle manager with AI translation and web scraping"
+    category: subtitle
+    image: ghcr.io/lavx/bazarr
+    tag: "latest"
+    ports: [6767]
+    adminPort: 6767
+    configPath: /config
+    mounts:
+      data: /data
+    envVars:
+      # Read from .env at compose time. Shared with ai-subtitle-translator
+      # so API keys can be AES-GCM-encrypted in transit between them.
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+    dependsOn: [sonarr, radarr, flaresolverr]
+    health:
+      # /api/system/ping is the documented unauthenticated readiness probe
+      # (bazarr/api/system/ping.py). Returns 200 {"status":"OK"} once the
+      # Flask app, DB, and scheduler are all up. Beats hitting / which
+      # returns 401 on authed instances and 200 very early on unauthed ones.
+      type: http
+      path: /api/system/ping
+      port: 6767
+    default: true
+    requiresAdminAuth: false
+
+  - id: ai-subtitle-translator
+    name: AI Subtitle Translator
+    description: Translates subtitles using AI models via OpenRouter
+    category: subtitle
+    image: ghcr.io/lavx/ai-subtitle-translator
+    tag: "latest"
+    ports: [8765]
+    configPath: /app/data
+    mounts: {}
+    envVars:
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+    dependsOn: [bazarr]
+    health:
+      type: http
+      path: /health
+      port: 8765
+    default: true
+    requiresAdminAuth: false
+
+  - id: jellyfin
+    name: Jellyfin
+    description: Free and open-source media server
+    category: media
+    image: jellyfin/jellyfin
+    tag: "latest"
+    ports: [8096]
+    adminPort: 8096
+    configPath: /config
+    mounts:
+      data: /data
+    envVars: {}
+    dependsOn: []
+    health:
+      type: http
+      path: /health
+      port: 8096
+    default: true
+    requiresAdminAuth: false
+    hwaccelSupport: true
+
+  - id: jellyseerr
+    name: Jellyseerr
+    description: Request management and media discovery tool for Jellyfin
+    category: request
+    image: ghcr.io/seerr-team/seerr
+    tag: "latest"
+    ports: [5055]
+    adminPort: 5055
+    configPath: /app/config
+    mounts: {}
+    envVars: {}
+    dependsOn: [jellyfin]
+    health:
+      type: http
+      path: /api/v1/status
+      port: 5055
+    default: true
+    requiresAdminAuth: false
+
+  - id: caddy
+    name: Caddy
+    description: Automatic HTTPS reverse proxy for the media stack
+    category: proxy
+    # We build Caddy locally via xcaddy so the caddy-dns/cloudflare and
+    # caddy-dns/duckdns providers are available out of the box. Remote-access
+    # modes (duckdns/cloudflare) require these plugins for DNS-01 ACME
+    # challenges. The stock caddy:latest image ships neither.
+    image: arrstack/caddy
+    tag: "local"
+    build:
+      context: ./caddy
+      dockerfile: Dockerfile
+    ports: [80, 443]
+    adminPort: 443
+    configPath: /config
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    health:
+      type: tcp
+      port: 80
+    default: true
+    requiresAdminAuth: false
+
+  - id: recyclarr
+    name: Recyclarr
+    description: Automatically sync TRaSH Guide settings to Sonarr and Radarr
+    category: utility
+    image: ghcr.io/recyclarr/recyclarr
+    tag: "latest"
+    ports: []
+    configPath: /config
+    mounts: {}
+    envVars: {}
+    dependsOn: [sonarr, radarr]
+    health:
+      type: tcp
+      port: 0
+    default: true
+    requiresAdminAuth: false
+
+  - id: tdarr
+    name: Tdarr
+    description: Distributed transcoding system for managing and converting media files
+    category: utility
+    image: ghcr.io/haveagitgat/tdarr
+    tag: "latest"
+    ports: [8265]
+    adminPort: 8265
+    configPath: /app/configs
+    mounts:
+      media: /media
+      transcode_cache: /temp
+    envVars: {}
+    dependsOn: []
+    health:
+      type: http
+      path: /
+      port: 8265
+    default: false
+    requiresAdminAuth: false
+    hwaccelSupport: true
+
+  - id: trailarr
+    name: Trailarr
+    description: Download and manage trailers for your media library
+    category: utility
+    image: nandyalu/trailarr
+    tag: "latest"
+    # Trailarr v0.8+ listens on 7889 (APP_PORT), not 7879. The old port in
+    # Prowlarr wikis/various guides is stale — verified against the container
+    # log: "Uvicorn running on http://0.0.0.0:7889".
+    ports: [7889]
+    adminPort: 7889
+    configPath: /config
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    health:
+      # /status is the readiness endpoint the container itself polls during
+      # boot (see container logs: GET /status -> 200 OK). / serves the SPA
+      # which can return 200 before the API is ready.
+      type: http
+      path: /status
+      port: 7889
+    default: true
+    requiresAdminAuth: false
+
+  - id: gluetun
+    name: Gluetun
+    description: VPN client in a thin Docker container for multiple VPN providers
+    category: utility
+    image: qmcgaw/gluetun
+    tag: "latest"
+    ports: []
+    configPath: /gluetun
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    # The installer's host-side health gate only probes http services. gluetun's
+    # control server (:8000) isn't published to the host, so an http probe would
+    # always time out; a tcp type makes the installer skip it. Boot ordering for
+    # the VPN-routed qBittorrent is enforced at the docker layer instead, via the
+    # compose-level healthcheck + `depends_on: { gluetun: service_healthy }`.
+    health:
+      type: tcp
+      port: 8000
+    default: false
+    requiresAdminAuth: false
+    # gluetun builds its own kill-switch with iptables/nftables on boot. Without
+    # NET_ADMIN it exits with "Could not fetch rule set generation id: Permission
+    # denied (you must be root)" before reaching the healthcheck. /dev/net/tun
+    # is required for the OpenVPN/WireGuard tunnel interface.
+    capAdd:
+      - NET_ADMIN
+    extraDevices:
+      - /dev/net/tun:/dev/net/tun
+
+  - id: deunhealth
+    name: Deunhealth
+    # Restarts qBittorrent when Docker marks it unhealthy. On a host reboot the
+    # daemon ignores depends_on ordering, so the VPN-routed qbit can start
+    # before gluetun and lose its published WebUI port; a plain restart policy
+    # doesn't help because qbit is up, just orphaned from gluetun's netns.
+    # deunhealth watches the deunhealth.restart.on.unhealthy label (only qbit
+    # carries it) and restarts it once gluetun is healthy again. The renderer
+    # bind-mounts /var/run/docker.sock (ro) so it can talk to the daemon.
+    description: Auto-restarts qBittorrent if it goes unhealthy after a reboot
+    category: utility
+    image: qmcgaw/deunhealth
+    tag: "latest"
+    ports: []
+    configPath: /config
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    default: false
+    requiresAdminAuth: false
+
+  - id: dnsmasq
+    name: dnsmasq
+    description: LAN-wide DNS so "*.<tld>" resolves to this host on every client
+    category: dns
+    image: jpillora/dnsmasq
+    tag: "latest"
+    # Host networking so the daemon can own UDP/TCP port 53 on the LAN without
+    # docker-proxy translation. Containerized port publishing on 53 conflicts
+    # with systemd-resolved on most distros.
+    networkMode: host
+    ports: []
+    configPath: /etc/dnsmasq.conf
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    health:
+      type: tcp
+      port: 53
+    default: false
+    requiresAdminAuth: false
+    capAdd:
+      - NET_ADMIN
+
+  - id: duckdns-updater
+    name: DuckDNS updater
+    description: Keeps the DuckDNS A record pointed at this host's public IP
+    category: ddns
+    image: lscr.io/linuxserver/duckdns
+    tag: "latest"
+    ports: []
+    configPath: /config
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    default: false
+    requiresAdminAuth: false
+
+  - id: cloudflare-ddns
+    name: Cloudflare DDNS
+    description: Keeps Cloudflare DNS records for this host's subdomains in sync
+    category: ddns
+    image: favonia/cloudflare-ddns
+    tag: "latest"
+    ports: []
+    configPath: /config
+    mounts: {}
+    envVars: {}
+    dependsOn: []
+    default: false
+    requiresAdminAuth: false
