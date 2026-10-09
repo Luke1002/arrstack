@@ -55,7 +55,7 @@ async function authenticate(
         "Content-Type": "application/json",
         "X-Emby-Authorization": authHeader,
       },
-      body: JSON.stringify({ Username: adminUser, Pw: adminPass }),
+      body: JSON.stringify({ Username: adminUser, Password: adminPass }),
     }),
   );
   if (!authRes.ok) {
